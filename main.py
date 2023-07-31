@@ -6,14 +6,15 @@ from interactions.api.events import CommandError
 
 from dotenv import load_dotenv
 from datetime import datetime
-from bookings import book, unbook, wait_for_sdr, delete_booking_entry
+
+from bookings import book, unbook, wait_for_sdr, delete_booking_entry, fetch_logfile
+from compute import start_instance, stop_instance
 
 from google.cloud import compute_v1
 
 import os
 import traceback
 import asyncio
-import concurrent.futures
 
 
 # Colors
@@ -26,10 +27,7 @@ red   = "#7c2c4c"
 load_dotenv()
 
 token = os.getenv("DISCORD_BOT_TOKEN")
-project_id = os.getenv("PROJECT_NAME")
 
-# Authenticate with GCP
-instance_client = compute_v1.InstancesClient()
 
 # intents are what events we want to receive from discord, `DEFAULT` is usually fine
 bot = Client(intents=Intents.DEFAULT)
@@ -94,7 +92,7 @@ async def book_command(ctx: SlashContext, region: str):
             timestamp   = datetime.now(),
             color       = red,
             title       = "**Bookings**",
-            description = "There are no available servers at the moment.\nPlease try again later.",
+            description = "There are no available servers at the moment. Please try again later.",
             footer      = "Regards"
         )
     if status == "success":
@@ -112,120 +110,113 @@ async def book_command(ctx: SlashContext, region: str):
     # Return if book failed
     if status != "success":
         return
-
-    async def send_details(ip):
-        status, booking = await wait_for_sdr(ip, instance_name)
-
-        if status == "failed":
-            embed = Embed(
-                timestamp   = datetime.now(),
-                color       = red,
-                title       = "**Bookings**",
-                description = "Your book request has failed. (database_error)\nPlease report this issue to @aqua_hopps",
-                footer      = "Apologies"
-            )
-        if status == "timeout":
-            embed = Embed(
-                timestamp   = datetime.now(),
-                color       = red,
-                title       = "**Bookings**",
-                description = "Your book request has failed. (server_timeout)\nPlease report this issue to @aqua_hopps",
-                footer      = "Apologies"
-            )
-
-        # Define variables
-        sdr_ip              = booking[0]
-        sdr_port            = booking[1]
-        sv_password         = booking[2]
-        connect_string      = f"connect {ip}:27015; password {sv_password}"
-        connect_string_sdr  = f"connect {sdr_ip}:{sdr_port}; password {sv_password}"
-        stv_string          = f"connect {ip}:27020"
-        stv_string_sdr      = f"connect {sdr_ip}:{sdr_port + 1}"
         
-        embed_dm = Embed(
-            timestamp   = datetime.now(),
-            color       = green,
-            title       = "**Bookings**",
-            description = "Your server is ready!",
-            footer      = "Have fun",
-            fields      = [
-                EmbedField(
-                    name    = "Default Connect",
-                    value   = f"```{connect_string}```",
-                    inline  = False
-                ),
-                EmbedField(
-                    name    = "SDR Connect",
-                    value   = f"```{connect_string_sdr}```",
-                    inline  = False
-                ),
-                EmbedField(
-                    name    = "STV Details",
-                    value   = f"```{stv_string}```",
-                    inline  = False
-                ),
-                EmbedField(
-                    name    = "SDR STV Details",
-                    value   = f"```{stv_string_sdr}```",
-                    inline  = False
-                ),
-                EmbedField(
-                    name    = "Server",
-                    value   = f"`{instance_name}`",
-                    inline  = True
-                ),
-                EmbedField(
-                    name    = "Region",
-                    value   = f"`{country}`",
-                    inline  = True
-                ),
-                EmbedField(
-                    name    = "Reminder",
-                    value   = "Use `!votemenu` to change configs and maps.",
-                    inline  = False
-                )
-            ]
-        )
-
-        embed = Embed(
-            timestamp   = datetime.now(),
-            color       = green,
-            title       = "**Bookings**",
-            description = "Server details have been sent to you via private message.",
-            footer      = "Have fun"
-        )
-
-        await ctx.author.user.send(embed=embed_dm)
-        await ctx.edit(msg.id, content=ctx.author.mention, embed=embed)
-
-    def get_external_ip(future):
-        response = instance_client.get(project=project_id, instance=instance_name, zone=instance_zone, timeout=10)
-        ip = response.network_interfaces[0].access_configs[0].nat_i_p
-        asyncio.create_task(send_details(ip))
-
     # Start the instance
     try:
-        operation = instance_client.start(project=project_id, instance=instance_name, zone=instance_zone, timeout=90)
-        operation.add_done_callback(get_external_ip)
+        ip = start_instance(instance_name, instance_zone)
 
-    except concurrent.futures.TimeoutError:
-        embed = Embed(
-            timestamp   = datetime.now(),
-            color       = red,
-            title       = "**Bookings**",
-            description = "Your book request has failed. (google_cloud_timeout)\nPlease report this issue to @aqua_hopps",
-            footer      = "Apologies"
-        )
-        await ctx.edit(msg.id, content=ctx.author.mention, embed=embed)
     except Exception as e:
+        print(f"Error starting instance: {e}")
         embed = Embed(
             timestamp   = datetime.now(),
             color       = red,
             title       = "**Bookings**",
-            description = "Your book request has failed. (google_cloud_error)\nPlease report this issue to @aqua_hopps",
+            description = "Your book request has failed. (gcp_error)\nPlease report this issue to @aqua_hopps",
             footer      = "Apologies"
         )
         await ctx.edit(msg.id, content=ctx.author.mention, embed=embed)
+        return
+    
+    status, server = await wait_for_sdr(ip, instance_name)
+
+    if status == "unbooked":
+        await ctx.delete(msg.id)
+        return
+    if status == "failed":
+        embed = Embed(
+            timestamp   = datetime.now(),
+            color       = red,
+            title       = "**Bookings**",
+            description = "Your book request has failed. (database_error)\nPlease report this issue to @aqua_hopps",
+            footer      = "Apologies"
+        )
+        await ctx.edit(msg.id, content=ctx.author.mention, embed=embed)
+        return
+    if status == "timeout":
+        embed = Embed(
+            timestamp   = datetime.now(),
+            color       = red,
+            title       = "**Bookings**",
+            description = "Your book request has failed. (server_timeout)\nPlease report this issue to @aqua_hopps",
+            footer      = "Apologies"
+        )
+        await ctx.edit(msg.id, content=ctx.author.mention, embed=embed)
+        return
+
+    # Define variables
+    sdr_ip              = server[0]
+    sdr_port            = server[1]
+    sv_password         = server[2]
+    connect_string      = f"connect {ip}:27015; password {sv_password}"
+    connect_string_sdr  = f"connect {sdr_ip}:{sdr_port}; password {sv_password}"
+    stv_string          = f"connect {ip}:27020"
+    stv_string_sdr      = f"connect {sdr_ip}:{sdr_port + 1}"
+        
+    embed_dm = Embed(
+        timestamp   = datetime.now(),
+        color       = green,
+        title       = "**Bookings**",
+        description = "Your server is ready!",
+        footer      = "Have fun",
+        fields      = [
+            EmbedField(
+                name    = "Default Connect",
+                value   = f"```{connect_string}```",
+                inline  = False
+            ),
+            EmbedField(
+                name    = "SDR Connect",
+                value   = f"```{connect_string_sdr}```",
+                inline  = False
+            ),
+            EmbedField(
+                name    = "STV Details",
+                value   = f"```{stv_string}```",
+                inline  = False
+            ),
+            EmbedField(
+                name    = "SDR STV Details",
+                value   = f"```{stv_string_sdr}```",
+                inline  = False
+            ),
+            EmbedField(
+                name    = "Server",
+                value   = f"`{instance_name}`",
+                inline  = True
+                ),
+            EmbedField(
+                name    = "Region",
+                value   = f"`{country}`",
+                inline  = True
+            ),
+            EmbedField(
+                name    = "Reminder",
+                value   = "Use `!votemenu` to change configs and maps.",
+                inline  = False
+            )
+        ]
+    )
+
+    embed = Embed(
+        timestamp   = datetime.now(),
+        color       = green,
+        title       = "**Bookings**",
+        description = "Server details have been sent to you via private message.",
+        footer      = "Have fun"
+    )
+
+    await ctx.author.user.send(embed=embed_dm)
+    await ctx.edit(msg.id, content=ctx.author.mention, embed=embed)
 
 
 @slash_command(name="unbook", description="Unbook your server.")
@@ -238,7 +229,7 @@ async def unbook_command(ctx: SlashContext):
     userid   = int(ctx.author.id)
     username = ctx.author.username
 
-    status, instance_name, instance_zone = await unbook(userid, username)
+    status, instance_name, instance_zone, ip, logid = await unbook(userid, username)
 
     if status == "failed":
         embed = Embed(
@@ -253,7 +244,15 @@ async def unbook_command(ctx: SlashContext):
             timestamp   = datetime.now(),
             color       = red,
             title       = "**Bookings**",
-            description = "You haven't booked a server yet.\nPlease book a server first.",
+            description = "You haven't booked a server yet. Please book a server first.",
+            footer      = "Regards"
+        )
+    if status == "starting":
+        embed = Embed(
+            timestamp   = datetime.now(),
+            color       = red,
+            title       = "**Bookings**",
+            description = "Cannot unbook your server at the moment. Please try again later.",
             footer      = "Regards"
         )
     if status == "success":
@@ -271,50 +270,41 @@ async def unbook_command(ctx: SlashContext):
     if status != "success":
         return
     
-    async def release_instance():
-        status = await delete_booking_entry(instance_name)
-        if status == "failed":
-            embed = Embed(
-                timestamp   = datetime.now(),
-                color       = red,
-                title       = "**Bookings**",
-                description = "Your unbook request has failed. (database_error)\nPlease report this issue to @aqua_hopps",
-                footer      = "Apologies"
-            )
-        if status == "success":
-            embed = Embed(
-                timestamp   = datetime.now(),
-                color       = green,
-                title       = "**Bookings**",
-                description = "Your server has been closed.\nThank you for using our service.",
-                footer      = "Have a nice day"
-            )
-        await ctx.edit(msg.id, content=ctx.author.mention, embed=embed)
-
-    def stopped(future):
-        asyncio.create_task(release_instance())
-
-    # Stop the instance
+    await fetch_logfile(logid, ip, instance_name)
+    
+    # Start the instance
     try:
-        operation = instance_client.stop(project=project_id, instance=instance_name, zone=instance_zone, timeout=90)
-        operation.add_done_callback(stopped)
-    except concurrent.futures.TimeoutError:
-        embed = Embed(
-            timestamp   = datetime.now(),
-            color       = red,
-            title       = "**Bookings**",
-            description = "Your unbook request has failed. (google_cloud_timeout)\nPlease report this issue to @aqua_hopps",
-            footer      = "Apologies"
-        )
-        await ctx.edit(msg.id, content=ctx.author.mention, embed=embed)
+        stop_instance(instance_name, instance_zone)
+
     except Exception as e:
+        print(f"Error stopping instance: {e}")
         embed = Embed(
             timestamp   = datetime.now(),
             color       = red,
             title       = "**Bookings**",
-            description = "Your unbook request has failed. (google_cloud_error)\nPlease report this issue to @aqua_hopps",
+            description = "Your unbook request has failed. (gcp_error)\nPlease report this issue to @aqua_hopps",
             footer      = "Apologies"
         )
         await ctx.edit(msg.id, content=ctx.author.mention, embed=embed)
+        return
+
+    status = await delete_booking_entry(instance_name)
+    if status == "failed":
+        embed = Embed(
+            timestamp   = datetime.now(),
+            color       = red,
+            title       = "**Bookings**",
+            description = "Your unbook request has failed. (database_error)\nPlease report this issue to @aqua_hopps",
+            footer      = "Apologies"
+        )
+    if status == "success":
+        embed = Embed(
+            timestamp   = datetime.now(),
+            color       = green,
+            title       = "**Bookings**",
+            description = "Your server has been closed. Thank you for using our service.",
+            footer      = "Have a nice day"
+        )
+    await ctx.edit(msg.id, content=ctx.author.mention, embed=embed)
 
 bot.start(token)

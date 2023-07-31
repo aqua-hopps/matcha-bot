@@ -1,5 +1,5 @@
-from dotenv import load_dotenv
 from datetime import datetime
+from dotenv import load_dotenv
 
 import os, sys
 import asyncio
@@ -7,6 +7,7 @@ import asyncio
 import aiomysql
 import asyncssh
 import hashlib
+
 
 load_dotenv()
 
@@ -27,42 +28,6 @@ ssh_info = {
     "port"          : 22,
     "known_hosts"   : None
 }
-
-async def ssh_fetch_log(logid, instance_name, ip):
-    try:
-        async with  asyncssh.connect(**ssh_info, host=ip) as conn:
-            command = f"/bin/bash server/fetch_log.sh {logid}"
-            await conn.run(command)
-            await asyncio.sleep(1)
-            async with conn.start_sftp_client() as sftp:
-                remote_path = f"server/logfile_{logid}.tar.gz"
-                local_path  = f"logfiles/logfile_{logid}.tar.gz"
-                await sftp.get(remotepaths=remote_path, localpath=local_path)
-                return local_path
-    except asyncssh.misc.PermissionDenied as e:
-        print(f"Failed to SSH to {instance_name}: {e}")
-        return None
-    except asyncssh.sftp.SFTPNoSuchFile as e:
-        print(f"Failed to retrieve logfile from {instance_name}: {e}")
-        return None
-
-
-async def generate_hash(file_path, algorithm="sha256"):
-    # Initialize the hash object with the chosen algorithm
-    hash_obj = hashlib.new(algorithm)
-
-    # Open the file in binary read mode
-    with open(file_path, "rb") as file:
-        # Read the file in chunks to avoid memory issues with large files
-        chunk_size = 4096
-        while chunk := file.read(chunk_size):
-            # Update the hash object with each chunk of data
-            hash_obj.update(chunk)
-
-    # Obtain the final hash value in hexadecimal format
-    file_hash = hash_obj.hexdigest()
-    return file_hash
-
 
 
 async def connect_to_database():
@@ -88,23 +53,32 @@ async def wait_for_sdr(ip, instance_name):
     finally:
         conn.close()
 
-    # wait for 180s
-    max_retries = int(180/db_polling_rate)
+    # wait for 120s
+    max_retries = int(120/db_polling_rate)
 
     for i in range(max_retries):
         await asyncio.sleep(db_polling_rate)
         conn = await connect_to_database()
+
         try:
             cursor = await conn.cursor()
 
+            # Find the user booking
             sql = "SELECT started FROM bookings WHERE instance_name = %s LIMIT 1"
             data = (instance_name,)
 
             await cursor.execute(sql, data)
+
+            # Premature unbook
+            if cursor.rowcount == 0:
+                return "unbooked", None
+
             started = await cursor.fetchone()
 
-            if started[0] == 0: continue
-
+            if started[0] == 0:
+                continue
+            
+            # SDR is ready, fetch fields
             sql = "SELECT sdr_ip, sdr_port, sv_password, rcon_password FROM bookings WHERE instance_name = %s LIMIT 1"
             data = (instance_name,)
 
@@ -121,6 +95,52 @@ async def wait_for_sdr(ip, instance_name):
             conn.close()
     
     return "timeout", None
+
+async def fetch_logfile(logid, ip, instance_name):
+    try:
+        # SSH into the instance
+        async with  asyncssh.connect(**ssh_info, host=ip) as conn:
+            # execute script on instance
+            command = f"/bin/bash server/fetch_log.sh {logid}"
+            await conn.run(command)
+
+            # Wait a while before retrieving log
+            await asyncio.sleep(1)
+            async with conn.start_sftp_client() as sftp:
+                remote_path = f"server/logfile_{logid}.tar.gz"
+                local_path  = f"logfiles/logfile_{logid}.tar.gz"
+                await sftp.get(remotepaths=remote_path, localpath=local_path)
+
+        # Generate hash for logfile
+        hash_obj = hashlib.new("sha256")
+
+        # Open the file in binary read mode
+        with open(local_path, "rb") as file:
+            # Read the file in chunks to avoid memory issues with large files
+            chunk_size = 4096
+            while chunk := file.read(chunk_size):
+                # Update the hash object with each chunk of data
+                hash_obj.update(chunk)
+
+        # Obtain the final hash value in hexadecimal format
+        logfile_hash = hash_obj.hexdigest()
+
+        conn = await connect_to_database()
+        try:
+            # Update hash to history table
+            cursor = await conn.cursor()
+            sql = "UPDATE history SET logfile_hash = %s WHERE id = %s"
+            data = (logfile_hash, logid)
+            await cursor.execute(sql, data)
+        except aiomysql.Error as e:
+            print(f"Error querying database while sending details: {e}")
+
+    except asyncssh.misc.PermissionDenied as e:
+        print(f"Failed to retrieve logfile from {instance_name}: {e}")
+        print(f"No logs for id: {logid}")
+    except asyncssh.sftp.SFTPNoSuchFile as e:
+        print(f"Failed to retrieve logfile from {instance_name}: {e}")
+        print(f"No logs for id: {logid}")
 
 
 async def delete_booking_entry(instance_name):
@@ -200,58 +220,42 @@ async def unbook(userid, username):
     try:
         cursor = await conn.cursor()
 
-        # Check if the user's discord_id exists in users table
-        sql = "SELECT * FROM users WHERE discord_id = %s LIMIT 1"
-        data = (userid,)
-        await cursor.execute(sql, data)
-
         # Update user info to users table
-        if cursor.rowcount == 1:
-            sql = "UPDATE users SET discord_alias = %s WHERE discord_id = %s"
+        sql = "UPDATE users SET discord_alias = %s WHERE discord_id = %s"
         data = (username, userid)
         await cursor.execute(sql, data)
 
         # Find the server booked by the user
-        sql = "SELECT instance_name, instance_zone, ip, start_time FROM bookings WHERE discord_id = %s LIMIT 1"
+        sql = "SELECT ip, instance_name, instance_zone, start_time FROM bookings WHERE discord_id = %s LIMIT 1"
         data = (userid,)
         await cursor.execute(sql, data)
         if cursor.rowcount == 0:
-            return "none", None, None
+            return "none", None, None, None, None
         
         # Fetch booking info
         booking = await cursor.fetchone()
 
+        # Check if instance has started
+        ip = booking[0]
+
+        if ip == "0.0.0.0":
+            return "starting", None, None, None, None
+
         # Define variables
-        instance_name   = booking[0]
-        instance_zone   = booking[1]
-        ip              = booking[2]
+        instance_name   = booking[1]
+        instance_zone   = booking[2]
         start_time      = booking[3]
         end_time        = datetime.now()
 
         # Create entry in history table
         sql = "INSERT INTO history (server, discord_id, discord_alias, start_time, end_time) VALUE (%s, %s, %s, %s, %s)"
         data = (instance_name, userid, username, start_time, end_time)
+
         await cursor.execute(sql, data)
-        
-        """
-        # Fetch log tarball from instance
         logid = cursor.lastrowid
-        logfile = await ssh_fetch_log(logid, instance_name, ip)
-        if logfile is None:
-            print(f"No logs for id={logid}")
-            return "success", instance_name, instance_zone
 
-        # Generate hash from file
-        logfile_hash = await generate_hash(logfile)
-
-        # Update hash to history table
-        sql = "UPDATE history SET logfile_hash = %s WHERE id = %s"
-        data = (logfile_hash, logid)
-        await cursor.execute(sql, data)
-        """
-        
-        return "success", instance_name, instance_zone
+        return "success", instance_name, instance_zone, ip, logid
 
     except aiomysql.Error as e:
         print(f"Error querying datebase while booking: {e}")
-        return "failed", None, None
+        return "failed", None, None, None, None
